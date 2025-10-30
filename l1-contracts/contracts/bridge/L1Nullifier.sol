@@ -109,30 +109,13 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
     IL1NativeTokenVault public l1NativeTokenVault;
 
     /*//////////////////////////////////////////////////////////////
-                      POST-WITHDRAWAL INTENTS (NEW)
+                   MINIMAL POST-WITHDRAWAL INTENT (NEW)
     //////////////////////////////////////////////////////////////*/
-    /// @dev Minimal metadata for an L2-proven, post-withdrawal intent.
-    struct IntentMeta {
-        address userL1;       // User's L1 wallet / SA (non-custodial funds holder)
-        address l1Token;      // L1 token expected to be present in userL1
-        uint256 amount;       // Amount user intended to act on post-withdrawal
-        bytes32 routeHash;    // keccak256(routeCalldata) to bind protocol/bridge/slippage params
-        uint256 deadline;     // UNIX timestamp (uint256 for simple decoding)
-        bool admitted;        // Set true once L2 proof for this intent is verified on L1
-    }
+    /// @dev True if a given requestId (emitted on L2) has been proven/admitted on L1.
+    mapping(bytes32 => bool) public isIntentAdmitted;
 
-    /// @dev requestId => intent metadata
-    mapping(bytes32 => IntentMeta) public intentById;
-
-    /// @dev Emitted when a post-withdrawal intent is admitted (proved) on L1.
-    event IntentAdmitted(
-        bytes32 indexed requestId,
-        address indexed userL1,
-        address indexed l1Token,
-        uint256 amount,
-        bytes32 routeHash,
-        uint256 deadline
-    );
+    /// @dev Emitted when an intent is admitted (proved) on L1.
+    event IntentAdmitted(bytes32 indexed requestId);
 
     /// @notice Checks that the message sender is the asset router..
     modifier onlyAssetRouter() {
@@ -276,79 +259,6 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
             revert ZeroAddress();
         }
         l1AssetRouter = IL1AssetRouter(_l1AssetRouter);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                 ADMIT L2-PROVEN POST-WITHDRAWAL INTENT (NEW)
-    //////////////////////////////////////////////////////////////*/
-    /// @notice Verifies and admits a post-withdrawal intent that was emitted on L2.
-    /// @dev The L2 emits a packed message with selector = this.admitPostWithdrawalIntent.selector
-    ///      and fields (userL1, l1Token, amount, requestId, routeHash, deadline), all tightly packed.
-    /// @param _chainId ZK chain ID the intent originated from.
-    /// @param _l2BatchNumber Batch where the intent message was included.
-    /// @param _l2MessageIndex Index in the L2->L1 logs tree.
-    /// @param _l2Sender Expected L2 sender (typically L2_ASSET_ROUTER_ADDR).
-    /// @param _l2TxNumberInBatch TX number in the batch that emitted the message.
-    /// @param _message Packed message bytes (length must be 172).
-    /// @param _merkleProof Inclusion proof for the message.
-    function admitPostWithdrawalIntent(
-        uint256 _chainId,
-        uint256 _l2BatchNumber,
-        uint256 _l2MessageIndex,
-        address _l2Sender,
-        uint16  _l2TxNumberInBatch,
-        bytes   calldata _message,
-        bytes32[] calldata _merkleProof
-    ) external nonReentrant whenNotPaused {
-        // Validate L2 sender contract
-        bool isL2SenderAllowed = (_l2Sender == L2_ASSET_ROUTER_ADDR);
-        if (!isL2SenderAllowed) {
-            revert WrongL2Sender(_l2Sender);
-        }
-
-        // Build the envelope and prove inclusion
-        L2Message memory l2ToL1Message = L2Message({
-            txNumberInBatch: _l2TxNumberInBatch,
-            sender: _l2Sender,
-            data: _message
-        });
-
-        bool ok = BRIDGE_HUB.proveL2MessageInclusion({
-            _chainId: _chainId,
-            _batchNumber: _l2BatchNumber,
-            _index: _l2MessageIndex,
-            _message: l2ToL1Message,
-            _proof: _merkleProof
-        });
-        if (!ok) {
-            revert InvalidProof();
-        }
-
-        // Parse and record the intent (no funds move here; non-custodial)
-        (
-            address userL1,
-            address l1Token,
-            uint256 amount,
-            bytes32 requestId,
-            bytes32 routeHash,
-            uint256 deadline
-        ) = _parseL2IntentMessage(_message);
-
-        if (intentById[requestId].admitted) {
-            // Already admitted; do not overwrite
-            revert DepositExists(); // reuse existing error for "already recorded"
-        }
-
-        intentById[requestId] = IntentMeta({
-            userL1: userL1,
-            l1Token: l1Token,
-            amount: amount,
-            routeHash: routeHash,
-            deadline: deadline,
-            admitted: true
-        });
-
-        emit IntentAdmitted(requestId, userL1, l1Token, amount, routeHash, deadline);
     }
 
     /// @notice Confirms the acceptance of a transaction by the Mailbox, as part of the L2 transaction process within Bridgehub.
@@ -637,6 +547,61 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
         }
     }
 
+    /*//////////////////////////////////////////////////////////////
+          ADMIT L2-PROVEN POST-WITHDRAWAL INTENT (MINIMAL)
+    //////////////////////////////////////////////////////////////*/
+    /// @notice Verifies & admits a post-withdrawal intent that L2 emitted.
+    /// @dev The L2 emits a packed message to this L1 contract with:
+    ///      abi.encodePacked(this.admitPostWithdrawalIntent.selector, requestId)
+    ///      total length = 36 bytes.
+    /// @param _chainId           ZK chain ID the intent originated from.
+    /// @param _l2BatchNumber     Batch where the intent message was included.
+    /// @param _l2MessageIndex    Index in the L2->L1 logs tree.
+    /// @param _l2Sender          Expected L2 sender (e.g., L2_ASSET_ROUTER_ADDR).
+    /// @param _l2TxNumberInBatch TX number in the batch that emitted the message.
+    /// @param _message           Packed message bytes (36 bytes).
+    /// @param _merkleProof       Inclusion proof for the message.
+    function admitPostWithdrawalIntent(
+        uint256 _chainId,
+        uint256 _l2BatchNumber,
+        uint256 _l2MessageIndex,
+        address _l2Sender,
+        uint16  _l2TxNumberInBatch,
+        bytes   calldata _message,
+        bytes32[] calldata _merkleProof
+    ) external nonReentrant whenNotPaused {
+        // 1) Validate L2 sender address.
+        if (_l2Sender != L2_ASSET_ROUTER_ADDR) {
+            revert WrongL2Sender(_l2Sender);
+        }
+
+        // 2) Prove inclusion of the L2->L1 message via Bridgehub.
+        L2Message memory l2ToL1Message = L2Message({
+            txNumberInBatch: _l2TxNumberInBatch,
+            sender: _l2Sender,
+            data: _message
+        });
+        bool ok = BRIDGE_HUB.proveL2MessageInclusion({
+            _chainId: _chainId,
+            _batchNumber: _l2BatchNumber,
+            _index: _l2MessageIndex,
+            _message: l2ToL1Message,
+            _proof: _merkleProof
+        });
+        if (!ok) {
+            revert InvalidProof();
+        }
+
+        // 3) Parse requestId and admit it.
+        bytes32 requestId = _parseL2IntentId(_message);
+        if (isIntentAdmitted[requestId]) {
+            // already admitted; prevent replay
+            revert DepositExists(); // reuse existing error to avoid adding a new one
+        }
+        isIntentAdmitted[requestId] = true;
+        emit IntentAdmitted(requestId);
+    }
+
     /// @notice Parses the withdrawal message and returns withdrawal details.
     /// @dev Currently, 3 different encoding versions are supported: legacy mailbox withdrawal, ERC20 bridge withdrawal,
     /// @dev and the latest version supported by shared bridge. Selectors are used for versioning.
@@ -877,58 +842,22 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
         });
         finalizeDeposit(finalizeWithdrawalParams);
     }
+
     /*//////////////////////////////////////////////////////////////
-                 INTENT MESSAGE DECODING (NEW)
+                 INTENT MESSAGE DECODING (MINIMAL)
     //////////////////////////////////////////////////////////////*/
-    /// @dev Decode the packed L2->L1 intent message.
-    /// Packed layout (no ABI padding):
-    ///   selector (4) ==
-    ///     this.admitPostWithdrawalIntent.selector
-    ///   address userL1 (20) |
-    ///   address l1Token (20) |
-    ///   uint256 amount (32) |
-    ///   bytes32 requestId (32) |
-    ///   bytes32 routeHash (32) |
-    ///   uint256 deadline (32)
-    /// Total length = 172 bytes.
-    function _parseL2IntentMessage(
+    /// @dev Decode the packed L2->L1 intent message:
+    ///      0..3   : bytes4 selector == this.admitPostWithdrawalIntent.selector
+    ///      4..35  : bytes32 requestId
+    function _parseL2IntentId(
         bytes memory _l2ToL1message
-    )
-        internal
-        pure
-        returns (
-            address userL1,
-            address l1Token,
-            uint256 amount,
-            bytes32 requestId,
-            bytes32 routeHash,
-            uint256 deadline
-        )
-    {
-        if (_l2ToL1message.length != 172) {
-            revert WrongMsgLength(172, _l2ToL1message.length);
+    ) internal pure returns (bytes32 requestId) {
+        // Expect exact 36 bytes (selector + requestId).
+        if (_l2ToL1message.length != 36) {
+            revert WrongMsgLength(36, _l2ToL1message.length);
         }
         (uint32 functionSignature, uint256 offset) = UnsafeBytes.readUint32(_l2ToL1message, 0);
-        // Require the selector to match this function (ensures the L2 crafted the right payload)
         require(bytes4(functionSignature) == this.admitPostWithdrawalIntent.selector, "intent/bad-selector");
-
-        (userL1,  offset) = UnsafeBytes.readAddress(_l2ToL1message, offset);
-        (l1Token, offset) = UnsafeBytes.readAddress(_l2ToL1message, offset);
-        (amount,  offset) = UnsafeBytes.readUint256(_l2ToL1message, offset);
-        (requestId, offset) = UnsafeBytes.readBytes32(_l2ToL1message, offset);
-        (routeHash,  offset) = UnsafeBytes.readBytes32(_l2ToL1message, offset);
-        (deadline, /*offset*/ ) = UnsafeBytes.readUint256(_l2ToL1message, offset);
+        (requestId, /*offset*/ ) = UnsafeBytes.readBytes32(_l2ToL1message, offset);
     }
-
-    /*//////////////////////////////////////////////////////////////
-                        INTENT GETTERS (NEW)
-    //////////////////////////////////////////////////////////////*/
-    function isIntentAdmitted(bytes32 requestId) external view returns (bool) {
-        return intentById[requestId].admitted;
-    }
-
-    function getIntent(bytes32 requestId) external view returns (IntentMeta memory) {
-        return intentById[requestId];
-    }
-
 }
