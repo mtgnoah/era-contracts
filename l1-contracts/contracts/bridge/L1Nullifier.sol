@@ -108,15 +108,6 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
     /// @dev Address of native token vault.
     IL1NativeTokenVault public l1NativeTokenVault;
 
-    /*//////////////////////////////////////////////////////////////
-                   MINIMAL POST-WITHDRAWAL INTENT (NEW)
-    //////////////////////////////////////////////////////////////*/
-    /// @dev True if a given requestId (emitted on L2) has been proven/admitted on L1.
-    mapping(bytes32 => bool) public isIntentAdmitted;
-
-    /// @dev Emitted when an intent is admitted (proved) on L1.
-    event IntentAdmitted(bytes32 indexed requestId);
-
     /// @notice Checks that the message sender is the asset router..
     modifier onlyAssetRouter() {
         if (msg.sender != address(l1AssetRouter)) {
@@ -547,61 +538,6 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-          ADMIT L2-PROVEN POST-WITHDRAWAL INTENT (MINIMAL)
-    //////////////////////////////////////////////////////////////*/
-    /// @notice Verifies & admits a post-withdrawal intent that L2 emitted.
-    /// @dev The L2 emits a packed message to this L1 contract with:
-    ///      abi.encodePacked(this.admitPostWithdrawalIntent.selector, requestId)
-    ///      total length = 36 bytes.
-    /// @param _chainId           ZK chain ID the intent originated from.
-    /// @param _l2BatchNumber     Batch where the intent message was included.
-    /// @param _l2MessageIndex    Index in the L2->L1 logs tree.
-    /// @param _l2Sender          Expected L2 sender (e.g., L2_ASSET_ROUTER_ADDR).
-    /// @param _l2TxNumberInBatch TX number in the batch that emitted the message.
-    /// @param _message           Packed message bytes (36 bytes).
-    /// @param _merkleProof       Inclusion proof for the message.
-    function admitPostWithdrawalIntent(
-        uint256 _chainId,
-        uint256 _l2BatchNumber,
-        uint256 _l2MessageIndex,
-        address _l2Sender,
-        uint16  _l2TxNumberInBatch,
-        bytes   calldata _message,
-        bytes32[] calldata _merkleProof
-    ) external nonReentrant whenNotPaused {
-        // 1) Validate L2 sender address.
-        if (_l2Sender != L2_ASSET_ROUTER_ADDR) {
-            revert WrongL2Sender(_l2Sender);
-        }
-
-        // 2) Prove inclusion of the L2->L1 message via Bridgehub.
-        L2Message memory l2ToL1Message = L2Message({
-            txNumberInBatch: _l2TxNumberInBatch,
-            sender: _l2Sender,
-            data: _message
-        });
-        bool ok = BRIDGE_HUB.proveL2MessageInclusion({
-            _chainId: _chainId,
-            _batchNumber: _l2BatchNumber,
-            _index: _l2MessageIndex,
-            _message: l2ToL1Message,
-            _proof: _merkleProof
-        });
-        if (!ok) {
-            revert InvalidProof();
-        }
-
-        // 3) Parse requestId and admit it.
-        bytes32 requestId = _parseL2IntentId(_message);
-        if (isIntentAdmitted[requestId]) {
-            // already admitted; prevent replay
-            revert DepositExists(); // reuse existing error to avoid adding a new one
-        }
-        isIntentAdmitted[requestId] = true;
-        emit IntentAdmitted(requestId);
-    }
-
     /// @notice Parses the withdrawal message and returns withdrawal details.
     /// @dev Currently, 3 different encoding versions are supported: legacy mailbox withdrawal, ERC20 bridge withdrawal,
     /// @dev and the latest version supported by shared bridge. Selectors are used for versioning.
@@ -841,23 +777,5 @@ contract L1Nullifier is IL1Nullifier, ReentrancyGuard, Ownable2StepUpgradeable, 
             merkleProof: _merkleProof
         });
         finalizeDeposit(finalizeWithdrawalParams);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                 INTENT MESSAGE DECODING (MINIMAL)
-    //////////////////////////////////////////////////////////////*/
-    /// @dev Decode the packed L2->L1 intent message:
-    ///      0..3   : bytes4 selector == this.admitPostWithdrawalIntent.selector
-    ///      4..35  : bytes32 requestId
-    function _parseL2IntentId(
-        bytes memory _l2ToL1message
-    ) internal pure returns (bytes32 requestId) {
-        // Expect exact 36 bytes (selector + requestId).
-        if (_l2ToL1message.length != 36) {
-            revert WrongMsgLength(36, _l2ToL1message.length);
-        }
-        (uint32 functionSignature, uint256 offset) = UnsafeBytes.readUint32(_l2ToL1message, 0);
-        require(bytes4(functionSignature) == this.admitPostWithdrawalIntent.selector, "intent/bad-selector");
-        (requestId, /*offset*/ ) = UnsafeBytes.readBytes32(_l2ToL1message, offset);
     }
 }
